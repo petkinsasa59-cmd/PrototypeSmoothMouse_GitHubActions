@@ -21,11 +21,13 @@ namespace {
 
 using DirectInput8CreateFn = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 using CreateDeviceFn = HRESULT (STDMETHODCALLTYPE*)(void*, REFGUID, void**, LPUNKNOWN);
-using GetDeviceStateFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);\nusing GetDeviceDataFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+using GetDeviceStateFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
+using GetDeviceDataFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
 
 DirectInput8CreateFn g_originalDirectInput8Create = nullptr;
 CreateDeviceFn g_originalCreateDevice = nullptr;
-GetDeviceStateFn g_originalGetDeviceState = nullptr;\nGetDeviceDataFn g_originalGetDeviceData = nullptr;
+GetDeviceStateFn g_originalGetDeviceState = nullptr;
+GetDeviceDataFn g_originalGetDeviceData = nullptr;
 
 std::mutex g_hookMutex;
 std::mutex g_logMutex;
