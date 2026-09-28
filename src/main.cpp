@@ -158,7 +158,8 @@ void RecordInput(LONG dx, LONG dy) {
 }
 
 void ProcessMouseState(DWORD cbData, LPVOID data) {
-    if (!g_enabled || data == nullptr || cbData < sizeof(LONG) * 3) return;
+    if (!g_enabled || data == nullptr) return;
+    if (cbData != sizeof(DIMOUSESTATE) && cbData != sizeof(DIMOUSESTATE2)) return;
 
     auto* values = static_cast<LONG*>(data);
     LONG rawX = values[0];
@@ -266,6 +267,45 @@ HRESULT WINAPI Hook_DirectInput8Create(HINSTANCE hinst, DWORD version, REFIID ri
     return hr;
 }
 
+bool BootstrapExistingDirectInput(DirectInput8CreateFn createExport) {
+    IDirectInput8A* probeDI = nullptr;
+    IDirectInputDevice8A* probeMouse = nullptr;
+
+    const HRESULT diHr = createExport(
+        GetModuleHandleA(nullptr),
+        DIRECTINPUT_VERSION,
+        IID_IDirectInput8A,
+        reinterpret_cast<void**>(&probeDI),
+        nullptr
+    );
+
+    if (FAILED(diHr) || !probeDI) {
+        LogLine("ERROR: diagnostic DirectInput8 object creation failed: " + std::to_string(static_cast<long>(diHr)));
+        return false;
+    }
+
+    const HRESULT mouseHr = probeDI->CreateDevice(GUID_SysMouse, &probeMouse, nullptr);
+    if (FAILED(mouseHr) || !probeMouse) {
+        LogLine("ERROR: diagnostic mouse device creation failed: " + std::to_string(static_cast<long>(mouseHr)));
+        probeDI->Release();
+        return false;
+    }
+
+    const bool diHooked = HookDirectInputObject(probeDI);
+    const bool mouseHooked = HookMouseDevice(probeMouse);
+
+    probeMouse->Release();
+    probeDI->Release();
+
+    if (diHooked && mouseHooked) {
+        LogLine("Bootstrap hooks installed from a temporary DirectInput mouse device.");
+        return true;
+    }
+
+    LogLine("ERROR: bootstrap hook installation was incomplete.");
+    return false;
+}
+
 DWORD WINAPI InitThread(LPVOID) {
     const std::string dir = ExeDirectory();
     g_iniPath = dir + "\\PrototypeSmoothMouse.ini";
@@ -278,7 +318,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.1 diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.2 diagnostic starting (x86).");
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
@@ -302,6 +342,13 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
+    auto createExport = reinterpret_cast<DirectInput8CreateFn>(target);
+
+    // The game may have already created DirectInput before this ASI starts.
+    // Create a temporary DirectInput mouse device only to discover the shared
+    // COM method addresses, then hook those method implementations directly.
+    BootstrapExistingDirectInput(createExport);
+
     const MH_STATUS createStatus = MH_CreateHook(target, reinterpret_cast<void*>(&Hook_DirectInput8Create), reinterpret_cast<void**>(&g_originalDirectInput8Create));
     if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED) {
         LogLine("ERROR: MH_CreateHook(DirectInput8Create) failed: " + std::to_string(static_cast<int>(createStatus)));
@@ -314,7 +361,7 @@ DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    LogLine("Hooked dinput8!DirectInput8Create. Waiting for mouse creation.");
+    LogLine("Hooked dinput8!DirectInput8Create. Direct mouse-state hook is active.");
     return 0;
 }
 
