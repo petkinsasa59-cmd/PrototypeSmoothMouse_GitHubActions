@@ -23,14 +23,22 @@ using DirectInput8CreateFn = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*
 using CreateDeviceFn = HRESULT (STDMETHODCALLTYPE*)(void*, REFGUID, void**, LPUNKNOWN);
 using GetDeviceStateFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
 using GetDeviceDataFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
+using SetDataFormatFn = HRESULT (STDMETHODCALLTYPE*)(void*, LPCDIDATAFORMAT);
 
 DirectInput8CreateFn g_originalDirectInput8Create = nullptr;
 CreateDeviceFn g_originalCreateDevice = nullptr;
 GetDeviceStateFn g_originalGetDeviceState = nullptr;
 GetDeviceDataFn g_originalGetDeviceData = nullptr;
+SetDataFormatFn g_originalSetDataFormat = nullptr;
 void* g_mouseDevice = nullptr;
 volatile LONG g_loggedFirstStateCall = 0;
 volatile LONG g_loggedFirstDataCall = 0;
+volatile LONG g_loggedStateCalls = 0;
+volatile LONG g_loggedFormats = 0;
+
+DWORD g_customDataSize = 0;
+DWORD g_customXOffset = 0xFFFFFFFFu;
+DWORD g_customYOffset = 0xFFFFFFFFu;
 
 std::mutex g_hookMutex;
 std::mutex g_logMutex;
@@ -200,19 +208,36 @@ void ProcessMouseState(DWORD cbData, LPVOID data) {
     }
 }
 
+void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
+    if (!g_enabled || !data) return;
+    if (g_customDataSize == 0 || cbData != g_customDataSize) return;
+    if (g_customXOffset == 0xFFFFFFFFu || g_customYOffset == 0xFFFFFFFFu) return;
+    if (g_customXOffset + sizeof(LONG) > cbData || g_customYOffset + sizeof(LONG) > cbData) return;
+
+    auto* bytes = static_cast<unsigned char*>(data);
+    const LONG rawX = *reinterpret_cast<LONG*>(bytes + g_customXOffset);
+    const LONG rawY = *reinterpret_cast<LONG*>(bytes + g_customYOffset);
+    RecordInput(rawX, rawY);
+}
+
 HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(void* self, DWORD cbData, LPVOID data) {
     if (!g_originalGetDeviceState) return DIERR_NOTINITIALIZED;
 
-    if (InterlockedCompareExchange(&g_loggedFirstStateCall, 1, 0) == 0) {
+    const LONG callNo = InterlockedIncrement(&g_loggedStateCalls);
+    if (callNo <= 12) {
         std::ostringstream ss;
-        ss << "FIRST GetDeviceState call: self=" << self
-           << " mouse=" << g_mouseDevice
+        ss << "GetDeviceState call #" << callNo
+           << ": self=" << self
+           << " createdMouse=" << g_mouseDevice
            << " cbData=" << cbData;
         LogLine(ss.str());
     }
 
     const HRESULT hr = g_originalGetDeviceState(self, cbData, data);
-    if (SUCCEEDED(hr)) ProcessMouseState(cbData, data);
+    if (SUCCEEDED(hr)) {
+        ProcessMouseState(cbData, data);
+        ProcessCustomMouseState(cbData, data);
+    }
     return hr;
 }
 
@@ -253,6 +278,49 @@ HRESULT STDMETHODCALLTYPE Hook_GetDeviceData(void* self, DWORD cbObjectData, LPD
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE Hook_SetDataFormat(void* self, LPCDIDATAFORMAT format) {
+    if (!g_originalSetDataFormat) return DIERR_NOTINITIALIZED;
+
+    const HRESULT hr = g_originalSetDataFormat(self, format);
+
+    if (format) {
+        const LONG n = InterlockedIncrement(&g_loggedFormats);
+        DWORD xOffset = 0xFFFFFFFFu;
+        DWORD yOffset = 0xFFFFFFFFu;
+
+        if (format->rgodf && format->dwNumObjs > 0) {
+            for (DWORD i = 0; i < format->dwNumObjs; ++i) {
+                const DIOBJECTDATAFORMAT& obj = format->rgodf[i];
+                if (!obj.pguid) continue;
+                if (IsEqualGUID(*obj.pguid, GUID_XAxis)) xOffset = obj.dwOfs;
+                if (IsEqualGUID(*obj.pguid, GUID_YAxis)) yOffset = obj.dwOfs;
+            }
+        }
+
+        if (n <= 12 || (xOffset != 0xFFFFFFFFu && yOffset != 0xFFFFFFFFu)) {
+            std::ostringstream ss;
+            ss << "SetDataFormat #" << n
+               << ": self=" << self
+               << " dataSize=" << format->dwDataSize
+               << " numObjs=" << format->dwNumObjs
+               << " flags=" << format->dwFlags
+               << " xOfs=" << xOffset
+               << " yOfs=" << yOffset
+               << " hr=" << static_cast<long>(hr);
+            LogLine(ss.str());
+        }
+
+        if (SUCCEEDED(hr) && xOffset != 0xFFFFFFFFu && yOffset != 0xFFFFFFFFu) {
+            g_customDataSize = format->dwDataSize;
+            g_customXOffset = xOffset;
+            g_customYOffset = yOffset;
+            LogLine("Captured mouse custom data format for GetDeviceState diagnostics.");
+        }
+    }
+
+    return hr;
+}
+
 bool HookMouseDevice(void* device) {
     if (!device) return false;
     std::lock_guard<std::mutex> lock(g_hookMutex);
@@ -264,10 +332,12 @@ bool HookMouseDevice(void* device) {
 
     void* stateTarget = vtable[9];
     void* dataTarget = vtable[10];
+    void* formatTarget = vtable[11];
 
     std::ostringstream before;
     before << "Actual mouse vtable: GetDeviceState=" << stateTarget
            << " GetDeviceData=" << dataTarget
+           << " SetDataFormat=" << formatTarget
            << " self=" << device;
     LogLine(before.str());
 
@@ -303,7 +373,23 @@ bool HookMouseDevice(void* device) {
         return false;
     }
 
-    LogLine("MinHook installed on the real mouse GetDeviceState + GetDeviceData targets.");
+    const MH_STATUS createFormat = MH_CreateHook(
+        formatTarget,
+        reinterpret_cast<void*>(&Hook_SetDataFormat),
+        reinterpret_cast<void**>(&g_originalSetDataFormat)
+    );
+    if (createFormat != MH_OK && createFormat != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(real SetDataFormat) failed: " + std::to_string(static_cast<int>(createFormat)));
+        return false;
+    }
+
+    const MH_STATUS enableFormat = MH_EnableHook(formatTarget);
+    if (enableFormat != MH_OK && enableFormat != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(real SetDataFormat) failed: " + std::to_string(static_cast<int>(enableFormat)));
+        return false;
+    }
+
+    LogLine("MinHook installed on real mouse GetDeviceState + GetDeviceData + SetDataFormat targets.");
     return true;
 }
 
@@ -389,7 +475,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.5 diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.6 diagnostic starting (x86).");
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
