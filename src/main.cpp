@@ -29,6 +29,8 @@ CreateDeviceFn g_originalCreateDevice = nullptr;
 GetDeviceStateFn g_originalGetDeviceState = nullptr;
 GetDeviceDataFn g_originalGetDeviceData = nullptr;
 void* g_mouseDevice = nullptr;
+volatile LONG g_loggedFirstStateCall = 0;
+volatile LONG g_loggedFirstDataCall = 0;
 
 std::mutex g_hookMutex;
 std::mutex g_logMutex;
@@ -200,13 +202,32 @@ void ProcessMouseState(DWORD cbData, LPVOID data) {
 
 HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(void* self, DWORD cbData, LPVOID data) {
     if (!g_originalGetDeviceState) return DIERR_NOTINITIALIZED;
+
+    if (InterlockedCompareExchange(&g_loggedFirstStateCall, 1, 0) == 0) {
+        std::ostringstream ss;
+        ss << "FIRST GetDeviceState call: self=" << self
+           << " mouse=" << g_mouseDevice
+           << " cbData=" << cbData;
+        LogLine(ss.str());
+    }
+
     const HRESULT hr = g_originalGetDeviceState(self, cbData, data);
-    if (self == g_mouseDevice && SUCCEEDED(hr)) ProcessMouseState(cbData, data);
+    if (SUCCEEDED(hr)) ProcessMouseState(cbData, data);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_GetDeviceData(void* self, DWORD cbObjectData, LPDIDEVICEOBJECTDATA data, LPDWORD inOutCount, DWORD flags) {
     if (!g_originalGetDeviceData) return DIERR_NOTINITIALIZED;
+
+    if (InterlockedCompareExchange(&g_loggedFirstDataCall, 1, 0) == 0) {
+        std::ostringstream ss;
+        ss << "FIRST GetDeviceData call: self=" << self
+           << " mouse=" << g_mouseDevice
+           << " cbObjectData=" << cbObjectData
+           << " count=" << (inOutCount ? *inOutCount : 0);
+        LogLine(ss.str());
+    }
+
     const HRESULT hr = g_originalGetDeviceData(self, cbObjectData, data, inOutCount, flags);
 
     if (self != g_mouseDevice) return hr;
@@ -241,36 +262,49 @@ bool HookMouseDevice(void* device) {
 
     g_mouseDevice = device;
 
-    void* currentState = vtable[9];
-    void* currentData = vtable[10];
+    void* stateTarget = vtable[9];
+    void* dataTarget = vtable[10];
 
     std::ostringstream before;
-    before << "Actual mouse vtable: GetDeviceState=" << currentState
-           << " GetDeviceData=" << currentData;
+    before << "Actual mouse vtable: GetDeviceState=" << stateTarget
+           << " GetDeviceData=" << dataTarget
+           << " self=" << device;
     LogLine(before.str());
 
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(&vtable[9], sizeof(void*) * 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        LogLine("ERROR: VirtualProtect(mouse vtable) failed: " + std::to_string(GetLastError()));
+    const MH_STATUS createState = MH_CreateHook(
+        stateTarget,
+        reinterpret_cast<void*>(&Hook_GetDeviceState),
+        reinterpret_cast<void**>(&g_originalGetDeviceState)
+    );
+    if (createState != MH_OK && createState != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(real GetDeviceState) failed: " + std::to_string(static_cast<int>(createState)));
         return false;
     }
 
-    if (currentState != reinterpret_cast<void*>(&Hook_GetDeviceState)) {
-        g_originalGetDeviceState = reinterpret_cast<GetDeviceStateFn>(currentState);
-        vtable[9] = reinterpret_cast<void*>(&Hook_GetDeviceState);
+    const MH_STATUS createData = MH_CreateHook(
+        dataTarget,
+        reinterpret_cast<void*>(&Hook_GetDeviceData),
+        reinterpret_cast<void**>(&g_originalGetDeviceData)
+    );
+    if (createData != MH_OK && createData != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(real GetDeviceData) failed: " + std::to_string(static_cast<int>(createData)));
+        return false;
     }
 
-    if (currentData != reinterpret_cast<void*>(&Hook_GetDeviceData)) {
-        g_originalGetDeviceData = reinterpret_cast<GetDeviceDataFn>(currentData);
-        vtable[10] = reinterpret_cast<void*>(&Hook_GetDeviceData);
+    const MH_STATUS enableState = MH_EnableHook(stateTarget);
+    if (enableState != MH_OK && enableState != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(real GetDeviceState) failed: " + std::to_string(static_cast<int>(enableState)));
+        return false;
     }
 
-    DWORD ignored = 0;
-    VirtualProtect(&vtable[9], sizeof(void*) * 2, oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), &vtable[9], sizeof(void*) * 2);
+    const MH_STATUS enableData = MH_EnableHook(dataTarget);
+    if (enableData != MH_OK && enableData != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(real GetDeviceData) failed: " + std::to_string(static_cast<int>(enableData)));
+        return false;
+    }
 
-    LogLine("Patched actual DirectInput mouse vtable (GetDeviceState + GetDeviceData).");
-    return g_originalGetDeviceState != nullptr && g_originalGetDeviceData != nullptr;
+    LogLine("MinHook installed on the real mouse GetDeviceState + GetDeviceData targets.");
+    return true;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(void* self, REFGUID guid, void** outDevice, LPUNKNOWN outer) {
@@ -355,7 +389,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.4 diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.5 diagnostic starting (x86).");
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
