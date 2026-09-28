@@ -15,16 +15,22 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 include(FetchContent)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
     minhook_src
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
     GIT_TAG v1.3.3
     GIT_SHALLOW TRUE
 )
+
 FetchContent_MakeAvailable(minhook_src)
 
 add_library(PrototypeSmoothMouse SHARED
     src/main.cpp
+)
+
+target_include_directories(PrototypeSmoothMouse PRIVATE
+    "${minhook_src_SOURCE_DIR}/include"
 )
 
 target_compile_definitions(PrototypeSmoothMouse PRIVATE
