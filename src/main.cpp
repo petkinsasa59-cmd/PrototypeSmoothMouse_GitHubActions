@@ -85,7 +85,7 @@ void LoadConfig() {
     g_logInput = GetPrivateProfileIntA("Debug", "LogInput", 1, g_iniPath.c_str()) != 0;
     g_smoothing = std::clamp(ReadFloat("Mouse", "Smoothing", 0.0f), 0.0f, 0.95f);
     g_sensitivityMultiplier = std::clamp(ReadFloat("Mouse", "SensitivityMultiplier", 1.0f), 0.05f, 20.0f);
-    g_spikeClamp = static_cast<LONG>(std::max(0, GetPrivateProfileIntA("Mouse", "SpikeClamp", 0, g_iniPath.c_str())));
+    const UINT spikeClamp = GetPrivateProfileIntA("Mouse", "SpikeClamp", 0, g_iniPath.c_str());\n    g_spikeClamp = static_cast<LONG>(spikeClamp);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
