@@ -215,9 +215,44 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
     if (g_customXOffset + sizeof(LONG) > cbData || g_customYOffset + sizeof(LONG) > cbData) return;
 
     auto* bytes = static_cast<unsigned char*>(data);
-    const LONG rawX = *reinterpret_cast<LONG*>(bytes + g_customXOffset);
-    const LONG rawY = *reinterpret_cast<LONG*>(bytes + g_customYOffset);
+    auto* xPtr = reinterpret_cast<LONG*>(bytes + g_customXOffset);
+    auto* yPtr = reinterpret_cast<LONG*>(bytes + g_customYOffset);
+
+    const LONG rawX = *xPtr;
+    const LONG rawY = *yPtr;
     RecordInput(rawX, rawY);
+
+    double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
+    double y = static_cast<double>(rawY) * g_sensitivityMultiplier;
+
+    if (g_spikeClamp > 0) {
+        x = std::clamp(x, -static_cast<double>(g_spikeClamp), static_cast<double>(g_spikeClamp));
+        y = std::clamp(y, -static_cast<double>(g_spikeClamp), static_cast<double>(g_spikeClamp));
+    }
+
+    if (g_smoothing > 0.0f) {
+        // The game polls DirectInput more often than many mice deliver new deltas.
+        // Keep total movement, but spread each delta over subsequent game polls.
+        // This fills otherwise-empty input polls at high frame rates with only a
+        // small amount of latency instead of inventing or dropping movement.
+        const double alpha = 1.0 - static_cast<double>(g_smoothing);
+        g_accumX += x;
+        g_accumY += y;
+
+        LONG outX = static_cast<LONG>(std::llround(g_accumX * alpha));
+        LONG outY = static_cast<LONG>(std::llround(g_accumY * alpha));
+
+        if (outX == 0 && std::abs(g_accumX) >= 1.0) outX = g_accumX > 0.0 ? 1 : -1;
+        if (outY == 0 && std::abs(g_accumY) >= 1.0) outY = g_accumY > 0.0 ? 1 : -1;
+
+        g_accumX -= outX;
+        g_accumY -= outY;
+        *xPtr = outX;
+        *yPtr = outY;
+    } else {
+        *xPtr = static_cast<LONG>(std::llround(x));
+        *yPtr = static_cast<LONG>(std::llround(y));
+    }
 }
 
 HRESULT STDMETHODCALLTYPE Hook_GetDeviceState(void* self, DWORD cbData, LPVOID data) {
@@ -508,7 +543,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.7 diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.8 smoothing test starting (x86).");
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
