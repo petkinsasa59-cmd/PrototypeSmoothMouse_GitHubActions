@@ -1,0 +1,35 @@
+name: Build PrototypeSmoothMouse x86
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+
+jobs:
+  build-x86:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Win32
+        run: cmake -S . -B build -A Win32 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item build/Release/aaa_PrototypeSmoothMouse.asi artifact/
+          Copy-Item PrototypeSmoothMouse.ini artifact/
+          Copy-Item README_RU.md artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrototypeSmoothMouse-x86
+          path: artifact/
+          if-no-files-found: error
