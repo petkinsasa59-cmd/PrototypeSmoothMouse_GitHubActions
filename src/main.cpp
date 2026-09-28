@@ -287,34 +287,67 @@ HRESULT STDMETHODCALLTYPE Hook_SetDataFormat(void* self, LPCDIDATAFORMAT format)
         const LONG n = InterlockedIncrement(&g_loggedFormats);
         DWORD xOffset = 0xFFFFFFFFu;
         DWORD yOffset = 0xFFFFFFFFu;
+        DWORD firstAxisOffset = 0xFFFFFFFFu;
+        DWORD secondAxisOffset = 0xFFFFFFFFu;
+        DWORD axisCount = 0;
 
         if (format->rgodf && format->dwNumObjs > 0) {
             for (DWORD i = 0; i < format->dwNumObjs; ++i) {
                 const DIOBJECTDATAFORMAT& obj = format->rgodf[i];
-                if (!obj.pguid) continue;
-                if (IsEqualGUID(*obj.pguid, GUID_XAxis)) xOffset = obj.dwOfs;
-                if (IsEqualGUID(*obj.pguid, GUID_YAxis)) yOffset = obj.dwOfs;
+
+                if (obj.pguid) {
+                    if (IsEqualGUID(*obj.pguid, GUID_XAxis)) xOffset = obj.dwOfs;
+                    if (IsEqualGUID(*obj.pguid, GUID_YAxis)) yOffset = obj.dwOfs;
+                }
+
+                if ((obj.dwType & DIDFT_AXIS) != 0) {
+                    if (axisCount == 0) firstAxisOffset = obj.dwOfs;
+                    if (axisCount == 1) secondAxisOffset = obj.dwOfs;
+                    ++axisCount;
+                }
+
+                if (self == g_mouseDevice && i < 16) {
+                    std::ostringstream objLog;
+                    objLog << "Mouse format obj[" << i << "]"
+                           << ": ofs=" << obj.dwOfs
+                           << " type=0x" << std::hex << obj.dwType << std::dec
+                           << " flags=0x" << std::hex << obj.dwFlags << std::dec
+                           << " hasGuid=" << (obj.pguid ? 1 : 0);
+                    LogLine(objLog.str());
+                }
             }
         }
 
-        if (n <= 12 || (xOffset != 0xFFFFFFFFu && yOffset != 0xFFFFFFFFu)) {
-            std::ostringstream ss;
-            ss << "SetDataFormat #" << n
-               << ": self=" << self
-               << " dataSize=" << format->dwDataSize
-               << " numObjs=" << format->dwNumObjs
-               << " flags=" << format->dwFlags
-               << " xOfs=" << xOffset
-               << " yOfs=" << yOffset
-               << " hr=" << static_cast<long>(hr);
-            LogLine(ss.str());
+        if (xOffset == 0xFFFFFFFFu && firstAxisOffset != 0xFFFFFFFFu) {
+            xOffset = firstAxisOffset;
+        }
+        if (yOffset == 0xFFFFFFFFu && secondAxisOffset != 0xFFFFFFFFu) {
+            yOffset = secondAxisOffset;
         }
 
-        if (SUCCEEDED(hr) && xOffset != 0xFFFFFFFFu && yOffset != 0xFFFFFFFFu) {
+        std::ostringstream ss;
+        ss << "SetDataFormat #" << n
+           << ": self=" << self
+           << " dataSize=" << format->dwDataSize
+           << " numObjs=" << format->dwNumObjs
+           << " flags=" << format->dwFlags
+           << " axisCount=" << axisCount
+           << " xOfs=" << xOffset
+           << " yOfs=" << yOffset
+           << " hr=" << static_cast<long>(hr);
+        LogLine(ss.str());
+
+        if (self == g_mouseDevice && SUCCEEDED(hr) &&
+            xOffset != 0xFFFFFFFFu && yOffset != 0xFFFFFFFFu) {
             g_customDataSize = format->dwDataSize;
             g_customXOffset = xOffset;
             g_customYOffset = yOffset;
-            LogLine("Captured mouse custom data format for GetDeviceState diagnostics.");
+
+            std::ostringstream captured;
+            captured << "Captured REAL mouse data format: size=" << g_customDataSize
+                     << " xOfs=" << g_customXOffset
+                     << " yOfs=" << g_customYOffset;
+            LogLine(captured.str());
         }
     }
 
@@ -475,7 +508,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.6 diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.7 diagnostic starting (x86).");
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
