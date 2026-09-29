@@ -51,11 +51,15 @@ bool g_logInput = true;
 float g_smoothing = 0.0f;
 float g_sensitivityMultiplier = 1.0f;
 LONG g_spikeClamp = 0;
+bool g_stallProtection = true;
+double g_stallThresholdMs = 12.0;
+double g_stallAlphaScale = 0.50;
 
 LARGE_INTEGER g_qpcFreq{};
 LARGE_INTEGER g_windowStart{};
 LARGE_INTEGER g_lastStateCall{};
 LARGE_INTEGER g_lastMotionCall{};
+LARGE_INTEGER g_lastCustomPoll{};
 std::uint64_t g_stateCalls = 0;
 std::uint64_t g_motionCalls = 0;
 double g_stateIntervalSumMs = 0.0;
@@ -66,6 +70,7 @@ std::uint64_t g_absX = 0;
 std::uint64_t g_absY = 0;
 double g_accumX = 0.0;
 double g_accumY = 0.0;
+volatile LONG g_stallEvents = 0;
 
 std::string ExeDirectory() {
     char path[MAX_PATH]{};
@@ -100,6 +105,9 @@ void LoadConfig() {
     g_sensitivityMultiplier = std::clamp(ReadFloat("Mouse", "SensitivityMultiplier", 1.0f), 0.05f, 20.0f);
     const UINT spikeClamp = GetPrivateProfileIntA("Mouse", "SpikeClamp", 0, g_iniPath.c_str());
     g_spikeClamp = static_cast<LONG>(spikeClamp);
+    g_stallProtection = GetPrivateProfileIntA("Mouse", "StallProtection", 1, g_iniPath.c_str()) != 0;
+    g_stallThresholdMs = std::clamp(static_cast<double>(ReadFloat("Mouse", "StallThresholdMs", 12.0f)), 6.0, 50.0);
+    g_stallAlphaScale = std::clamp(static_cast<double>(ReadFloat("Mouse", "StallAlphaScale", 0.50f)), 0.20, 1.0);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
@@ -220,6 +228,15 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
 
     const LONG rawX = *xPtr;
     const LONG rawY = *yPtr;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    double pollGapMs = 0.0;
+    if (g_lastCustomPoll.QuadPart != 0) {
+        pollGapMs = MsBetween(g_lastCustomPoll, now);
+    }
+    g_lastCustomPoll = now;
+
     RecordInput(rawX, rawY);
 
     double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
@@ -235,7 +252,28 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
         // Keep total movement, but spread each delta over subsequent game polls.
         // This fills otherwise-empty input polls at high frame rates with only a
         // small amount of latency instead of inventing or dropping movement.
-        const double alpha = 1.0 - static_cast<double>(g_smoothing);
+        double alpha = 1.0 - static_cast<double>(g_smoothing);
+
+        const bool stalled = g_stallProtection &&
+                             pollGapMs >= g_stallThresholdMs &&
+                             (rawX != 0 || rawY != 0);
+
+        if (stalled) {
+            alpha = std::max(0.25, alpha * g_stallAlphaScale);
+
+            const LONG stallNo = InterlockedIncrement(&g_stallEvents);
+            if (stallNo <= 30) {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(2)
+                   << "STALL_PROTECT #" << stallNo
+                   << " gap=" << pollGapMs << "ms"
+                   << " rawX=" << rawX
+                   << " rawY=" << rawY
+                   << " releaseAlpha=" << alpha;
+                LogLine(ss.str());
+            }
+        }
+
         g_accumX += x;
         g_accumY += y;
 
@@ -543,7 +581,18 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.8 smoothing test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.9 adaptive stall smoothing starting (x86).");
+
+    {
+        std::ostringstream cfg;
+        cfg << std::fixed << std::setprecision(2)
+            << "CONFIG smoothing=" << g_smoothing
+            << " sensitivity=" << g_sensitivityMultiplier
+            << " stallProtection=" << (g_stallProtection ? 1 : 0)
+            << " stallThresholdMs=" << g_stallThresholdMs
+            << " stallAlphaScale=" << g_stallAlphaScale;
+        LogLine(cfg.str());
+    }
 
     const MH_STATUS initStatus = MH_Initialize();
     if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
