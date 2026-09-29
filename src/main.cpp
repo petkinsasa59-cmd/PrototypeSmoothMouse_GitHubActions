@@ -295,10 +295,6 @@ void ProcessMouseState(DWORD cbData, LPVOID data) {
     LONG rawY = values[1];
     RecordInput(rawX, rawY);
 
-    if (rawX != 0 || rawY != 0) {
-        g_lastMouseMotion = now;
-    }
-
     double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
     double y = static_cast<double>(rawY) * g_sensitivityMultiplier;
 
@@ -350,6 +346,10 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
     g_lastCustomPoll = now;
 
     RecordInput(rawX, rawY);
+
+    if (rawX != 0 || rawY != 0) {
+        g_lastMouseMotion = now;
+    }
 
     double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
     double y = static_cast<double>(rawY) * g_sensitivityMultiplier;
