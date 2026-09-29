@@ -72,9 +72,12 @@ bool g_timeBasedSmoothing = true;
 double g_smoothingReferenceMs = 4.0;
 
 bool g_motionBlurEnabled = false;
-double g_motionBlurStrength = 0.08;
+double g_motionBlurStrength = 0.16;
 double g_motionBlurHoldMs = 70.0;
-double g_motionBlurHistoryMs = 8.0;
+double g_motionBlurHistoryMs = 12.0;
+double g_motionBlurTrailScale = 0.80;
+double g_motionBlurStallBoost = 0.10;
+int g_motionBlurSamples = 4;
 
 LARGE_INTEGER g_qpcFreq{};
 LARGE_INTEGER g_windowStart{};
@@ -103,6 +106,7 @@ std::uint64_t g_frameOver12 = 0;
 std::uint64_t g_frameOver20 = 0;
 std::uint64_t g_frameOver33 = 0;
 volatile LONG g_frameStallLogs = 0;
+double g_lastFrameGapMs = 0.0;
 
 IDirect3DDevice9* g_blurDevice = nullptr;
 IDirect3DTexture9* g_blurPrevTexture = nullptr;
@@ -116,6 +120,8 @@ bool g_motionWasActive = false;
 LARGE_INTEGER g_lastBlurCapture{};
 volatile LONG g_blurFailureLogged = 0;
 volatile LONG g_blurSuccessLogged = 0;
+double g_blurMotionX = 0.0;
+double g_blurMotionY = 0.0;
 
 std::string ExeDirectory() {
     char path[MAX_PATH]{};
@@ -156,10 +162,13 @@ void LoadConfig() {
     g_timeBasedSmoothing = GetPrivateProfileIntA("Mouse", "TimeBasedSmoothing", 1, g_iniPath.c_str()) != 0;
     g_smoothingReferenceMs = std::clamp(static_cast<double>(ReadFloat("Mouse", "SmoothingReferenceMs", 4.0f)), 1.0, 16.0);
 
-    g_motionBlurEnabled = GetPrivateProfileIntA("Visual", "MotionBlur", 0, g_iniPath.c_str()) != 0;
-    g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.08f)), 0.0, 0.35);
+    g_motionBlurEnabled = GetPrivateProfileIntA("Visual", "MotionBlur", 1, g_iniPath.c_str()) != 0;
+    g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.16f)), 0.0, 0.35);
     g_motionBlurHoldMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHoldMs", 70.0f)), 10.0, 250.0);
-    g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 8.0f)), 2.0, 30.0);
+    g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 12.0f)), 2.0, 30.0);
+    g_motionBlurTrailScale = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurTrailScale", 0.80f)), 0.0, 3.0);
+    g_motionBlurStallBoost = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStallBoost", 0.10f)), 0.0, 0.25);
+    g_motionBlurSamples = std::clamp(GetPrivateProfileIntA("Visual", "MotionBlurSamples", 4, g_iniPath.c_str()), 1, 8);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
@@ -249,6 +258,7 @@ void RecordPresent() {
     double gapMs = 0.0;
     if (g_lastPresent.QuadPart != 0) {
         gapMs = MsBetween(g_lastPresent, now);
+        g_lastFrameGapMs = gapMs;
         g_frameIntervalSumMs += gapMs;
         g_maxFrameGapMs = std::max(g_maxFrameGapMs, gapMs);
         if (gapMs >= 12.0) ++g_frameOver12;
@@ -353,6 +363,11 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
 
     if (rawX != 0 || rawY != 0) {
         g_lastMouseMotion = now;
+
+        // Keep a short, low-noise direction estimate for cinematic turn blur.
+        // This does not feed back into gameplay input.
+        g_blurMotionX = (g_blurMotionX * 0.60) + (static_cast<double>(rawX) * 0.40);
+        g_blurMotionY = (g_blurMotionY * 0.60) + (static_cast<double>(rawY) * 0.40);
     }
 
     double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
@@ -585,6 +600,8 @@ void ReleaseBlurResources() {
     g_blurPrevValid = false;
     g_motionWasActive = false;
     g_lastBlurCapture = {};
+    g_blurMotionX = 0.0;
+    g_blurMotionY = 0.0;
 }
 
 bool EnsureBlurResources(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer) {
@@ -658,6 +675,8 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         g_motionWasActive = false;
         g_blurPrevValid = false;
         g_lastBlurCapture = {};
+        g_blurMotionX = 0.0;
+        g_blurMotionY = 0.0;
         return;
     }
 
@@ -673,6 +692,8 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         g_motionWasActive = false;
         g_blurPrevValid = false;
         g_lastBlurCapture = {};
+        g_blurMotionX *= 0.35;
+        g_blurMotionY *= 0.35;
         return;
     }
 
@@ -689,9 +710,6 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         return;
     }
 
-    // At very high FPS the immediately previous frame is only 2-4 ms old and
-    // temporal blur is almost invisible. Keep a slightly older clean frame
-    // (normally ~8 ms) so a low blend strength still produces a visible trail.
     bool refreshHistory = !g_blurPrevValid;
     if (g_lastBlurCapture.QuadPart == 0) {
         refreshHistory = true;
@@ -730,21 +748,36 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
 
         const float w = static_cast<float>(g_blurWidth);
         const float h = static_cast<float>(g_blurHeight);
-        const BlurVertex quad[4] = {
-            {-0.5f,     -0.5f,      0.0f, 1.0f, 0.0f, 0.0f},
-            {w - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f},
-            {-0.5f,      h - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f},
-            {w - 0.5f,   h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f}
-        };
 
+        double strength = g_motionBlurStrength;
+        double trailScale = g_motionBlurTrailScale;
+
+        // A long frame is exactly when the micro-stutter is most visible.
+        // Briefly increase the visual trail on that frame only.
+        if (g_lastFrameGapMs >= 10.0) {
+            strength = std::min(0.35, strength + g_motionBlurStallBoost);
+            trailScale *= 1.35;
+        }
+
+        const double maxTrailPx = 36.0;
+        double trailX = std::clamp(-g_blurMotionX * trailScale, -maxTrailPx, maxTrailPx);
+        double trailY = std::clamp(-g_blurMotionY * trailScale, -maxTrailPx, maxTrailPx);
+
+        // Small movement should still create a visible cinematic smear.
+        if (std::abs(trailX) < 1.25 && std::abs(g_blurMotionX) >= 0.5) {
+            trailX = g_blurMotionX > 0.0 ? -1.25 : 1.25;
+        }
+        if (std::abs(trailY) < 1.25 && std::abs(g_blurMotionY) >= 0.5) {
+            trailY = g_blurMotionY > 0.0 ? -1.25 : 1.25;
+        }
+
+        const int samples = std::clamp(g_motionBlurSamples, 1, 8);
+        const double perTap = 1.0 - std::pow(1.0 - strength, 1.0 / static_cast<double>(samples));
         const DWORD alphaByte = static_cast<DWORD>(
-            std::clamp(g_motionBlurStrength, 0.0, 0.35) * 255.0
+            std::clamp(perTap, 0.0, 0.35) * 255.0
         );
         const DWORD textureFactor = (alphaByte << 24) | 0x00FFFFFFu;
 
-        // Present is normally called after the game's EndScene. DrawPrimitiveUP
-        // outside BeginScene/EndScene is invalid on D3D9, which is why the first
-        // implementation could silently render nothing.
         const HRESULT beginHr = device->BeginScene();
         const bool beganScene = SUCCEEDED(beginHr);
 
@@ -772,12 +805,30 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
         device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
-        const HRESULT drawHr = device->DrawPrimitiveUP(
-            D3DPT_TRIANGLESTRIP,
-            2,
-            quad,
-            sizeof(BlurVertex)
-        );
+        HRESULT drawHr = D3D_OK;
+        for (int i = 1; i <= samples; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(samples);
+            const float ox = static_cast<float>(trailX) * t;
+            const float oy = static_cast<float>(trailY) * t;
+
+            const BlurVertex quad[4] = {
+                {-0.5f + ox,     -0.5f + oy,      0.0f, 1.0f, 0.0f, 0.0f},
+                {w - 0.5f + ox,  -0.5f + oy,      0.0f, 1.0f, 1.0f, 0.0f},
+                {-0.5f + ox,      h - 0.5f + oy,  0.0f, 1.0f, 0.0f, 1.0f},
+                {w - 0.5f + ox,   h - 0.5f + oy,  0.0f, 1.0f, 1.0f, 1.0f}
+            };
+
+            const HRESULT hr = device->DrawPrimitiveUP(
+                D3DPT_TRIANGLESTRIP,
+                2,
+                quad,
+                sizeof(BlurVertex)
+            );
+            if (FAILED(hr)) {
+                drawHr = hr;
+                break;
+            }
+        }
 
         if (beganScene) {
             device->EndScene();
@@ -791,6 +842,8 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
                 ok << std::fixed << std::setprecision(2)
                    << "MOTION_BLUR_ACTIVE strength=" << g_motionBlurStrength
                    << " historyMs=" << g_motionBlurHistoryMs
+                   << " trailScale=" << g_motionBlurTrailScale
+                   << " samples=" << g_motionBlurSamples
                    << " holdMs=" << g_motionBlurHoldMs;
                 LogLine(ok.str());
             }
@@ -807,6 +860,10 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         std::swap(g_blurPrevTexture, g_blurCurrTexture);
         g_lastBlurCapture = now;
     }
+
+    // Keep the visual direction smooth, independent from gameplay smoothing.
+    g_blurMotionX *= 0.88;
+    g_blurMotionY *= 0.88;
 
     g_motionWasActive = true;
     backBuffer->Release();
@@ -1142,7 +1199,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.13 visible turn motion blur test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.14 directional turn motion blur test starting (x86).");
 
     {
         std::ostringstream cfg;
@@ -1157,7 +1214,10 @@ DWORD WINAPI InitThread(LPVOID) {
             << " motionBlur=" << (g_motionBlurEnabled ? 1 : 0)
             << " blurStrength=" << g_motionBlurStrength
             << " blurHoldMs=" << g_motionBlurHoldMs
-            << " blurHistoryMs=" << g_motionBlurHistoryMs;
+            << " blurHistoryMs=" << g_motionBlurHistoryMs
+            << " blurTrailScale=" << g_motionBlurTrailScale
+            << " blurSamples=" << g_motionBlurSamples
+            << " blurStallBoost=" << g_motionBlurStallBoost;
         LogLine(cfg.str());
     }
 
