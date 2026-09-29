@@ -74,6 +74,7 @@ double g_smoothingReferenceMs = 4.0;
 bool g_motionBlurEnabled = false;
 double g_motionBlurStrength = 0.08;
 double g_motionBlurHoldMs = 70.0;
+double g_motionBlurHistoryMs = 8.0;
 
 LARGE_INTEGER g_qpcFreq{};
 LARGE_INTEGER g_windowStart{};
@@ -112,7 +113,9 @@ UINT g_blurHeight = 0;
 D3DFORMAT g_blurFormat = D3DFMT_UNKNOWN;
 bool g_blurPrevValid = false;
 bool g_motionWasActive = false;
+LARGE_INTEGER g_lastBlurCapture{};
 volatile LONG g_blurFailureLogged = 0;
+volatile LONG g_blurSuccessLogged = 0;
 
 std::string ExeDirectory() {
     char path[MAX_PATH]{};
@@ -156,6 +159,7 @@ void LoadConfig() {
     g_motionBlurEnabled = GetPrivateProfileIntA("Visual", "MotionBlur", 0, g_iniPath.c_str()) != 0;
     g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.08f)), 0.0, 0.35);
     g_motionBlurHoldMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHoldMs", 70.0f)), 10.0, 250.0);
+    g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 8.0f)), 2.0, 30.0);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
@@ -580,6 +584,7 @@ void ReleaseBlurResources() {
     g_blurFormat = D3DFMT_UNKNOWN;
     g_blurPrevValid = false;
     g_motionWasActive = false;
+    g_lastBlurCapture = {};
 }
 
 bool EnsureBlurResources(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer) {
@@ -652,6 +657,7 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
     if (!g_motionBlurEnabled || g_motionBlurStrength <= 0.0) {
         g_motionWasActive = false;
         g_blurPrevValid = false;
+        g_lastBlurCapture = {};
         return;
     }
 
@@ -666,6 +672,7 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
     if (!motionActive) {
         g_motionWasActive = false;
         g_blurPrevValid = false;
+        g_lastBlurCapture = {};
         return;
     }
 
@@ -682,17 +689,40 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         return;
     }
 
-    // Capture the clean current frame before drawing the previous-frame blend.
-    if (!CopyBackBufferToTexture(device, backBuffer, g_blurCurrTexture)) {
-        if (InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
-            LogLine("Motion blur disabled for this run: StretchRect failed.");
+    // At very high FPS the immediately previous frame is only 2-4 ms old and
+    // temporal blur is almost invisible. Keep a slightly older clean frame
+    // (normally ~8 ms) so a low blend strength still produces a visible trail.
+    bool refreshHistory = !g_blurPrevValid;
+    if (g_lastBlurCapture.QuadPart == 0) {
+        refreshHistory = true;
+    } else if (MsBetween(g_lastBlurCapture, now) >= g_motionBlurHistoryMs) {
+        refreshHistory = true;
+    }
+
+    if (!g_blurPrevValid) {
+        if (!CopyBackBufferToTexture(device, backBuffer, g_blurPrevTexture)) {
+            if (InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
+                LogLine("Motion blur disabled for this run: initial StretchRect failed.");
+            }
+            backBuffer->Release();
+            return;
         }
-        g_blurPrevValid = false;
+        g_blurPrevValid = true;
+        g_motionWasActive = true;
+        g_lastBlurCapture = now;
         backBuffer->Release();
         return;
     }
 
-    if (g_blurPrevValid && g_motionWasActive) {
+    bool capturedCurrent = false;
+    if (refreshHistory) {
+        capturedCurrent = CopyBackBufferToTexture(device, backBuffer, g_blurCurrTexture);
+        if (!capturedCurrent && InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
+            LogLine("Motion blur history update failed: StretchRect failed.");
+        }
+    }
+
+    if (g_motionWasActive && SUCCEEDED(g_blurStateBlock->Capture())) {
         struct BlurVertex {
             float x, y, z, rhw;
             float u, v;
@@ -707,49 +737,77 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
             {w - 0.5f,   h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f}
         };
 
-        if (SUCCEEDED(g_blurStateBlock->Capture())) {
-            const DWORD alphaByte = static_cast<DWORD>(
-                std::clamp(g_motionBlurStrength, 0.0, 0.35) * 255.0
-            );
-            const DWORD textureFactor = (alphaByte << 24) | 0x00FFFFFFu;
+        const DWORD alphaByte = static_cast<DWORD>(
+            std::clamp(g_motionBlurStrength, 0.0, 0.35) * 255.0
+        );
+        const DWORD textureFactor = (alphaByte << 24) | 0x00FFFFFFu;
 
-            device->SetVertexShader(nullptr);
-            device->SetPixelShader(nullptr);
-            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-            device->SetTexture(0, g_blurPrevTexture);
+        // Present is normally called after the game's EndScene. DrawPrimitiveUP
+        // outside BeginScene/EndScene is invalid on D3D9, which is why the first
+        // implementation could silently render nothing.
+        const HRESULT beginHr = device->BeginScene();
+        const bool beganScene = SUCCEEDED(beginHr);
 
-            device->SetRenderState(D3DRS_ZENABLE, FALSE);
-            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-            device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-            device->SetRenderState(D3DRS_TEXTUREFACTOR, textureFactor);
-            device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        device->SetTexture(0, g_blurPrevTexture);
 
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, textureFactor);
+        device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
 
-            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
 
-            device->DrawPrimitiveUP(
-                D3DPT_TRIANGLESTRIP,
-                2,
-                quad,
-                sizeof(BlurVertex)
-            );
+        device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 
-            g_blurStateBlock->Apply();
+        const HRESULT drawHr = device->DrawPrimitiveUP(
+            D3DPT_TRIANGLESTRIP,
+            2,
+            quad,
+            sizeof(BlurVertex)
+        );
+
+        if (beganScene) {
+            device->EndScene();
+        }
+
+        g_blurStateBlock->Apply();
+
+        if (SUCCEEDED(drawHr)) {
+            if (InterlockedCompareExchange(&g_blurSuccessLogged, 1, 0) == 0) {
+                std::ostringstream ok;
+                ok << std::fixed << std::setprecision(2)
+                   << "MOTION_BLUR_ACTIVE strength=" << g_motionBlurStrength
+                   << " historyMs=" << g_motionBlurHistoryMs
+                   << " holdMs=" << g_motionBlurHoldMs;
+                LogLine(ok.str());
+            }
+        } else if (InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
+            std::ostringstream fail;
+            fail << "Motion blur draw failed: BeginSceneHr="
+                 << static_cast<long>(beginHr)
+                 << " DrawHr=" << static_cast<long>(drawHr);
+            LogLine(fail.str());
         }
     }
 
-    std::swap(g_blurPrevTexture, g_blurCurrTexture);
-    g_blurPrevValid = true;
+    if (capturedCurrent) {
+        std::swap(g_blurPrevTexture, g_blurCurrTexture);
+        g_lastBlurCapture = now;
+    }
+
     g_motionWasActive = true;
     backBuffer->Release();
 }
@@ -1084,7 +1142,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.12 time-based smoothing + turn blur test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.13 visible turn motion blur test starting (x86).");
 
     {
         std::ostringstream cfg;
@@ -1098,7 +1156,8 @@ DWORD WINAPI InitThread(LPVOID) {
             << " smoothingReferenceMs=" << g_smoothingReferenceMs
             << " motionBlur=" << (g_motionBlurEnabled ? 1 : 0)
             << " blurStrength=" << g_motionBlurStrength
-            << " blurHoldMs=" << g_motionBlurHoldMs;
+            << " blurHoldMs=" << g_motionBlurHoldMs
+            << " blurHistoryMs=" << g_motionBlurHistoryMs;
         LogLine(cfg.str());
     }
 
