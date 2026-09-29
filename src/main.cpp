@@ -596,35 +596,90 @@ bool BootstrapD3D9() {
         return false;
     }
 
-    auto** vtable = *reinterpret_cast<void***>(probe);
-    if (!vtable) {
-        probe->Release();
-        return false;
-    }
-
-    void* createDeviceTarget = vtable[16];
-    const MH_STATUS createHook = MH_CreateHook(
-        createDeviceTarget,
-        reinterpret_cast<void*>(&Hook_D3DCreateDevice),
-        reinterpret_cast<void**>(&g_originalD3DCreateDevice)
+    HWND hwnd = CreateWindowExA(
+        0, "STATIC", "PrototypeSmoothMouse_D3D9Probe",
+        WS_OVERLAPPEDWINDOW,
+        0, 0, 64, 64,
+        nullptr, nullptr, GetModuleHandleA(nullptr), nullptr
     );
 
-    if (createHook != MH_OK && createHook != MH_ERROR_ALREADY_CREATED) {
-        LogLine("ERROR: MH_CreateHook(D3D9 CreateDevice) failed: " + std::to_string(static_cast<int>(createHook)));
+    if (!hwnd) {
+        LogLine("D3D9 diagnostics unavailable: temporary window creation failed.");
         probe->Release();
         return false;
     }
 
-    const MH_STATUS enableHook = MH_EnableHook(createDeviceTarget);
-    if (enableHook != MH_OK && enableHook != MH_ERROR_ENABLED) {
-        LogLine("ERROR: MH_EnableHook(D3D9 CreateDevice) failed: " + std::to_string(static_cast<int>(enableHook)));
-        probe->Release();
-        return false;
+    D3DPRESENT_PARAMETERS pp{};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.hDeviceWindow = hwnd;
+    pp.BackBufferFormat = D3DFMT_UNKNOWN;
+    pp.BackBufferWidth = 64;
+    pp.BackBufferHeight = 64;
+    pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+
+    IDirect3DDevice9* tempDevice = nullptr;
+    HRESULT deviceHr = probe->CreateDevice(
+        D3DADAPTER_DEFAULT,
+        D3DDEVTYPE_HAL,
+        hwnd,
+        D3DCREATE_SOFTWARE_VERTEXPROCESSING,
+        &pp,
+        &tempDevice
+    );
+
+    if (FAILED(deviceHr) || !tempDevice) {
+        deviceHr = probe->CreateDevice(
+            D3DADAPTER_DEFAULT,
+            D3DDEVTYPE_REF,
+            hwnd,
+            D3DCREATE_SOFTWARE_VERTEXPROCESSING,
+            &pp,
+            &tempDevice
+        );
+    }
+
+    bool presentHooked = false;
+    if (SUCCEEDED(deviceHr) && tempDevice) {
+        presentHooked = HookD3DDevice(tempDevice);
+        if (presentHooked) {
+            LogLine("Bootstrap Present hook installed from a temporary D3D9 device.");
+        }
+        tempDevice->Release();
+    } else {
+        LogLine("D3D9 diagnostics unavailable: temporary device creation failed: " +
+                std::to_string(static_cast<long>(deviceHr)));
+    }
+
+    // Also keep CreateDevice hooked in case the game or renderer creates another
+    // device later. The Present hook above is the important path for an already
+    // existing game device.
+    auto** vtable = *reinterpret_cast<void***>(probe);
+    if (vtable) {
+        void* createDeviceTarget = vtable[16];
+        const MH_STATUS createHook = MH_CreateHook(
+            createDeviceTarget,
+            reinterpret_cast<void*>(&Hook_D3DCreateDevice),
+            reinterpret_cast<void**>(&g_originalD3DCreateDevice)
+        );
+
+        if (createHook == MH_OK || createHook == MH_ERROR_ALREADY_CREATED) {
+            const MH_STATUS enableHook = MH_EnableHook(createDeviceTarget);
+            if (enableHook == MH_OK || enableHook == MH_ERROR_ENABLED) {
+                LogLine("Hooked IDirect3D9::CreateDevice for future D3D9 devices.");
+            } else {
+                LogLine("ERROR: MH_EnableHook(D3D9 CreateDevice) failed: " +
+                        std::to_string(static_cast<int>(enableHook)));
+            }
+        } else {
+            LogLine("ERROR: MH_CreateHook(D3D9 CreateDevice) failed: " +
+                    std::to_string(static_cast<int>(createHook)));
+        }
     }
 
     probe->Release();
-    LogLine("Hooked IDirect3D9::CreateDevice. Waiting for the game's D3D9 device.");
-    return true;
+    DestroyWindow(hwnd);
+    return presentHooked;
 }
 
 bool HookMouseDevice(void* device) {
@@ -781,7 +836,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.10 frame-pacing diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.11 direct Present diagnostic starting (x86).");
 
     {
         std::ostringstream cfg;
