@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <dinput.h>
+#include <d3d9.h>
 #include <MinHook.h>
 
 #include <algorithm>
@@ -25,11 +26,24 @@ using GetDeviceStateFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPVOID);
 using GetDeviceDataFn = HRESULT (STDMETHODCALLTYPE*)(void*, DWORD, LPDIDEVICEOBJECTDATA, LPDWORD, DWORD);
 using SetDataFormatFn = HRESULT (STDMETHODCALLTYPE*)(void*, LPCDIDATAFORMAT);
 
+using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
+using D3DCreateDeviceFn = HRESULT (STDMETHODCALLTYPE*)(
+    void*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**
+);
+using D3DPresentFn = HRESULT (STDMETHODCALLTYPE*)(
+    void*, const RECT*, const RECT*, HWND, const RGNDATA*
+);
+
 DirectInput8CreateFn g_originalDirectInput8Create = nullptr;
 CreateDeviceFn g_originalCreateDevice = nullptr;
 GetDeviceStateFn g_originalGetDeviceState = nullptr;
 GetDeviceDataFn g_originalGetDeviceData = nullptr;
 SetDataFormatFn g_originalSetDataFormat = nullptr;
+
+D3DCreateDeviceFn g_originalD3DCreateDevice = nullptr;
+D3DPresentFn g_originalD3DPresent = nullptr;
+void* g_d3dDevice = nullptr;
+
 void* g_mouseDevice = nullptr;
 volatile LONG g_loggedFirstStateCall = 0;
 volatile LONG g_loggedFirstDataCall = 0;
@@ -71,6 +85,16 @@ std::uint64_t g_absY = 0;
 double g_accumX = 0.0;
 double g_accumY = 0.0;
 volatile LONG g_stallEvents = 0;
+
+LARGE_INTEGER g_frameWindowStart{};
+LARGE_INTEGER g_lastPresent{};
+std::uint64_t g_frameCalls = 0;
+double g_frameIntervalSumMs = 0.0;
+double g_maxFrameGapMs = 0.0;
+std::uint64_t g_frameOver12 = 0;
+std::uint64_t g_frameOver20 = 0;
+std::uint64_t g_frameOver33 = 0;
+volatile LONG g_frameStallLogs = 0;
 
 std::string ExeDirectory() {
     char path[MAX_PATH]{};
@@ -175,6 +199,66 @@ void RecordInput(LONG dx, LONG dy) {
            << " absY=" << g_absY;
         LogLine(ss.str());
         ResetStats(now);
+    }
+}
+
+void ResetFrameStats(const LARGE_INTEGER& now) {
+    g_frameWindowStart = now;
+    g_lastPresent = {};
+    g_frameCalls = 0;
+    g_frameIntervalSumMs = 0.0;
+    g_maxFrameGapMs = 0.0;
+    g_frameOver12 = 0;
+    g_frameOver20 = 0;
+    g_frameOver33 = 0;
+}
+
+void RecordPresent() {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (g_frameWindowStart.QuadPart == 0) ResetFrameStats(now);
+
+    double gapMs = 0.0;
+    if (g_lastPresent.QuadPart != 0) {
+        gapMs = MsBetween(g_lastPresent, now);
+        g_frameIntervalSumMs += gapMs;
+        g_maxFrameGapMs = std::max(g_maxFrameGapMs, gapMs);
+        if (gapMs >= 12.0) ++g_frameOver12;
+        if (gapMs >= 20.0) ++g_frameOver20;
+        if (gapMs >= 33.0) ++g_frameOver33;
+
+        if (gapMs >= 12.0) {
+            const LONG n = InterlockedIncrement(&g_frameStallLogs);
+            if (n <= 80) {
+                std::ostringstream stall;
+                stall << std::fixed << std::setprecision(2)
+                      << "FRAME_STALL #" << n
+                      << " gap=" << gapMs << "ms";
+                LogLine(stall.str());
+            }
+        }
+    }
+    g_lastPresent = now;
+    ++g_frameCalls;
+
+    const double windowMs = MsBetween(g_frameWindowStart, now);
+    if (windowMs >= 1000.0) {
+        const double seconds = windowMs / 1000.0;
+        const double fps = g_frameCalls / seconds;
+        const double avgFrame = g_frameCalls > 1
+            ? g_frameIntervalSumMs / static_cast<double>(g_frameCalls - 1)
+            : 0.0;
+
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(2)
+           << "FRAME  fps=" << fps
+           << " avg=" << avgFrame << "ms"
+           << " max=" << g_maxFrameGapMs << "ms"
+           << " over12=" << g_frameOver12
+           << " over20=" << g_frameOver20
+           << " over33=" << g_frameOver33;
+        LogLine(ss.str());
+        ResetFrameStats(now);
     }
 }
 
@@ -427,6 +511,122 @@ HRESULT STDMETHODCALLTYPE Hook_SetDataFormat(void* self, LPCDIDATAFORMAT format)
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE Hook_D3DPresent(
+    void* self,
+    const RECT* sourceRect,
+    const RECT* destRect,
+    HWND destWindow,
+    const RGNDATA* dirtyRegion
+) {
+    RecordPresent();
+    return g_originalD3DPresent(self, sourceRect, destRect, destWindow, dirtyRegion);
+}
+
+bool HookD3DDevice(void* device) {
+    if (!device) return false;
+
+    auto** vtable = *reinterpret_cast<void***>(device);
+    if (!vtable) return false;
+
+    g_d3dDevice = device;
+    void* presentTarget = vtable[17];
+
+    std::ostringstream ss;
+    ss << "D3D9 real device: Present=" << presentTarget
+       << " self=" << device;
+    LogLine(ss.str());
+
+    const MH_STATUS createPresent = MH_CreateHook(
+        presentTarget,
+        reinterpret_cast<void*>(&Hook_D3DPresent),
+        reinterpret_cast<void**>(&g_originalD3DPresent)
+    );
+    if (createPresent != MH_OK && createPresent != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(D3D9 Present) failed: " + std::to_string(static_cast<int>(createPresent)));
+        return false;
+    }
+
+    const MH_STATUS enablePresent = MH_EnableHook(presentTarget);
+    if (enablePresent != MH_OK && enablePresent != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(D3D9 Present) failed: " + std::to_string(static_cast<int>(enablePresent)));
+        return false;
+    }
+
+    LogLine("Hooked D3D9 Present for frame-time diagnostics.");
+    return true;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_D3DCreateDevice(
+    void* self,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* params,
+    IDirect3DDevice9** outDevice
+) {
+    const HRESULT hr = g_originalD3DCreateDevice(
+        self, adapter, deviceType, focusWindow, behaviorFlags, params, outDevice
+    );
+
+    if (SUCCEEDED(hr) && outDevice && *outDevice) {
+        LogLine("D3D9 game device created.");
+        HookD3DDevice(*outDevice);
+    }
+
+    return hr;
+}
+
+bool BootstrapD3D9() {
+    HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
+    if (!d3d9) {
+        LogLine("D3D9 diagnostics unavailable: d3d9.dll not loaded.");
+        return false;
+    }
+
+    auto create9 = reinterpret_cast<Direct3DCreate9Fn>(GetProcAddress(d3d9, "Direct3DCreate9"));
+    if (!create9) {
+        LogLine("D3D9 diagnostics unavailable: Direct3DCreate9 export not found.");
+        return false;
+    }
+
+    IDirect3D9* probe = create9(D3D_SDK_VERSION);
+    if (!probe) {
+        LogLine("D3D9 diagnostics unavailable: Direct3DCreate9 returned null.");
+        return false;
+    }
+
+    auto** vtable = *reinterpret_cast<void***>(probe);
+    if (!vtable) {
+        probe->Release();
+        return false;
+    }
+
+    void* createDeviceTarget = vtable[16];
+    const MH_STATUS createHook = MH_CreateHook(
+        createDeviceTarget,
+        reinterpret_cast<void*>(&Hook_D3DCreateDevice),
+        reinterpret_cast<void**>(&g_originalD3DCreateDevice)
+    );
+
+    if (createHook != MH_OK && createHook != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(D3D9 CreateDevice) failed: " + std::to_string(static_cast<int>(createHook)));
+        probe->Release();
+        return false;
+    }
+
+    const MH_STATUS enableHook = MH_EnableHook(createDeviceTarget);
+    if (enableHook != MH_OK && enableHook != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(D3D9 CreateDevice) failed: " + std::to_string(static_cast<int>(enableHook)));
+        probe->Release();
+        return false;
+    }
+
+    probe->Release();
+    LogLine("Hooked IDirect3D9::CreateDevice. Waiting for the game's D3D9 device.");
+    return true;
+}
+
 bool HookMouseDevice(void* device) {
     if (!device) return false;
     std::lock_guard<std::mutex> lock(g_hookMutex);
@@ -581,7 +781,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.9 adaptive stall smoothing starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.10 frame-pacing diagnostic starting (x86).");
 
     {
         std::ostringstream cfg;
@@ -599,6 +799,8 @@ DWORD WINAPI InitThread(LPVOID) {
         LogLine("ERROR: MH_Initialize failed: " + std::to_string(static_cast<int>(initStatus)));
         return 0;
     }
+
+    BootstrapD3D9();
 
     HMODULE dinput = nullptr;
     for (int i = 0; i < 600 && !dinput; ++i) {
