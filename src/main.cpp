@@ -168,7 +168,7 @@ void LoadConfig() {
     g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 12.0f)), 2.0, 30.0);
     g_motionBlurTrailScale = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurTrailScale", 0.80f)), 0.0, 3.0);
     g_motionBlurStallBoost = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStallBoost", 0.10f)), 0.0, 0.25);
-    g_motionBlurSamples = std::clamp(GetPrivateProfileIntA("Visual", "MotionBlurSamples", 4, g_iniPath.c_str()), 1, 8);
+    g_motionBlurSamples = std::clamp(static_cast<int>(GetPrivateProfileIntA("Visual", "MotionBlurSamples", 4, g_iniPath.c_str())), 1, 8);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
