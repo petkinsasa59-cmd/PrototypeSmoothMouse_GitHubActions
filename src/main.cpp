@@ -412,22 +412,40 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
             alpha = std::clamp(alpha, 0.05, 1.0);
         }
 
-        const bool stalled = g_stallProtection &&
-                             pollGapMs >= g_stallThresholdMs &&
-                             (rawX != 0 || rawY != 0);
+        const bool inputStall = g_stallProtection &&
+                                pollGapMs >= g_stallThresholdMs &&
+                                (rawX != 0 || rawY != 0);
 
-        if (stalled) {
-            // With time-based smoothing a long frame should catch up, not add
-            // another delayed tail. Keep the historical scale only as a tiny
-            // safety floor for old configs.
-            alpha = std::max(alpha, 1.0 - (0.20 * g_stallAlphaScale));
+        // Present is recorded after the game finishes a frame. On the next
+        // input poll, g_lastFrameGapMs still describes that just-finished frame.
+        // This catches render stalls that did not produce a >=12 ms input-poll
+        // gap, and lets us soften the camera catch-up on the following frame.
+        const bool frameStallBridge = g_stallProtection &&
+                                      g_lastFrameGapMs >= g_stallThresholdMs;
+
+        if (inputStall || frameStallBridge) {
+            // IMPORTANT: time-based smoothing normally raises alpha toward 1.0
+            // after a long gap. That is correct for latency, but visually it
+            // dumps almost the entire accumulated turn into one rendered frame.
+            // During a rare stall, cap the release instead and spread catch-up
+            // over the next few normal polls/frames.
+            const double normalImmediate = 1.0 - static_cast<double>(g_smoothing);
+            const double stallAlpha = std::clamp(
+                normalImmediate * g_stallAlphaScale,
+                0.25,
+                0.65
+            );
+            alpha = std::min(alpha, stallAlpha);
 
             const LONG stallNo = InterlockedIncrement(&g_stallEvents);
-            if (stallNo <= 30) {
+            if (stallNo <= 40) {
                 std::ostringstream ss;
                 ss << std::fixed << std::setprecision(2)
-                   << "STALL_PROTECT #" << stallNo
-                   << " gap=" << pollGapMs << "ms"
+                   << "STALL_BRIDGE #" << stallNo
+                   << " pollGap=" << pollGapMs << "ms"
+                   << " frameGap=" << g_lastFrameGapMs << "ms"
+                   << " inputStall=" << (inputStall ? 1 : 0)
+                   << " frameBridge=" << (frameStallBridge ? 1 : 0)
                    << " rawX=" << rawX
                    << " rawY=" << rawY
                    << " releaseAlpha=" << alpha;
@@ -1266,7 +1284,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.18 safe smooth-blur test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.19 stall-bridge smoothing test starting (x86).");
 
     {
         std::ostringstream cfg;
