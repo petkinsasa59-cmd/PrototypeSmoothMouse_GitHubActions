@@ -68,12 +68,19 @@ LONG g_spikeClamp = 0;
 bool g_stallProtection = true;
 double g_stallThresholdMs = 12.0;
 double g_stallAlphaScale = 0.50;
+bool g_timeBasedSmoothing = true;
+double g_smoothingReferenceMs = 4.0;
+
+bool g_motionBlurEnabled = false;
+double g_motionBlurStrength = 0.08;
+double g_motionBlurHoldMs = 70.0;
 
 LARGE_INTEGER g_qpcFreq{};
 LARGE_INTEGER g_windowStart{};
 LARGE_INTEGER g_lastStateCall{};
 LARGE_INTEGER g_lastMotionCall{};
 LARGE_INTEGER g_lastCustomPoll{};
+LARGE_INTEGER g_lastMouseMotion{};
 std::uint64_t g_stateCalls = 0;
 std::uint64_t g_motionCalls = 0;
 double g_stateIntervalSumMs = 0.0;
@@ -95,6 +102,17 @@ std::uint64_t g_frameOver12 = 0;
 std::uint64_t g_frameOver20 = 0;
 std::uint64_t g_frameOver33 = 0;
 volatile LONG g_frameStallLogs = 0;
+
+IDirect3DDevice9* g_blurDevice = nullptr;
+IDirect3DTexture9* g_blurPrevTexture = nullptr;
+IDirect3DTexture9* g_blurCurrTexture = nullptr;
+IDirect3DStateBlock9* g_blurStateBlock = nullptr;
+UINT g_blurWidth = 0;
+UINT g_blurHeight = 0;
+D3DFORMAT g_blurFormat = D3DFMT_UNKNOWN;
+bool g_blurPrevValid = false;
+bool g_motionWasActive = false;
+volatile LONG g_blurFailureLogged = 0;
 
 std::string ExeDirectory() {
     char path[MAX_PATH]{};
@@ -132,6 +150,12 @@ void LoadConfig() {
     g_stallProtection = GetPrivateProfileIntA("Mouse", "StallProtection", 1, g_iniPath.c_str()) != 0;
     g_stallThresholdMs = std::clamp(static_cast<double>(ReadFloat("Mouse", "StallThresholdMs", 12.0f)), 6.0, 50.0);
     g_stallAlphaScale = std::clamp(static_cast<double>(ReadFloat("Mouse", "StallAlphaScale", 0.50f)), 0.20, 1.0);
+    g_timeBasedSmoothing = GetPrivateProfileIntA("Mouse", "TimeBasedSmoothing", 1, g_iniPath.c_str()) != 0;
+    g_smoothingReferenceMs = std::clamp(static_cast<double>(ReadFloat("Mouse", "SmoothingReferenceMs", 4.0f)), 1.0, 16.0);
+
+    g_motionBlurEnabled = GetPrivateProfileIntA("Visual", "MotionBlur", 0, g_iniPath.c_str()) != 0;
+    g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.08f)), 0.0, 0.35);
+    g_motionBlurHoldMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHoldMs", 70.0f)), 10.0, 250.0);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
@@ -271,6 +295,10 @@ void ProcessMouseState(DWORD cbData, LPVOID data) {
     LONG rawY = values[1];
     RecordInput(rawX, rawY);
 
+    if (rawX != 0 || rawY != 0) {
+        g_lastMouseMotion = now;
+    }
+
     double x = static_cast<double>(rawX) * g_sensitivityMultiplier;
     double y = static_cast<double>(rawY) * g_sensitivityMultiplier;
 
@@ -338,12 +366,34 @@ void ProcessCustomMouseState(DWORD cbData, LPVOID data) {
         // small amount of latency instead of inventing or dropping movement.
         double alpha = 1.0 - static_cast<double>(g_smoothing);
 
+        if (g_timeBasedSmoothing) {
+            // Treat Smoothing as the fraction of residual motion that remains
+            // after one reference interval. This keeps the same feel when the
+            // game polls at 200, 300, 450+ Hz instead of making smoothing depend
+            // on the number of GetDeviceState calls.
+            const double dtMs = std::clamp(
+                pollGapMs > 0.0 ? pollGapMs : g_smoothingReferenceMs,
+                0.25,
+                50.0
+            );
+            const double residual = std::clamp(
+                static_cast<double>(g_smoothing),
+                0.001,
+                0.95
+            );
+            alpha = 1.0 - std::pow(residual, dtMs / g_smoothingReferenceMs);
+            alpha = std::clamp(alpha, 0.05, 1.0);
+        }
+
         const bool stalled = g_stallProtection &&
                              pollGapMs >= g_stallThresholdMs &&
                              (rawX != 0 || rawY != 0);
 
         if (stalled) {
-            alpha = std::max(0.25, alpha * g_stallAlphaScale);
+            // With time-based smoothing a long frame should catch up, not add
+            // another delayed tail. Keep the historical scale only as a tiny
+            // safety floor for old configs.
+            alpha = std::max(alpha, 1.0 - (0.20 * g_stallAlphaScale));
 
             const LONG stallNo = InterlockedIncrement(&g_stallEvents);
             if (stallNo <= 30) {
@@ -511,6 +561,199 @@ HRESULT STDMETHODCALLTYPE Hook_SetDataFormat(void* self, LPCDIDATAFORMAT format)
     return hr;
 }
 
+void ReleaseBlurResources() {
+    if (g_blurStateBlock) {
+        g_blurStateBlock->Release();
+        g_blurStateBlock = nullptr;
+    }
+    if (g_blurPrevTexture) {
+        g_blurPrevTexture->Release();
+        g_blurPrevTexture = nullptr;
+    }
+    if (g_blurCurrTexture) {
+        g_blurCurrTexture->Release();
+        g_blurCurrTexture = nullptr;
+    }
+    g_blurDevice = nullptr;
+    g_blurWidth = 0;
+    g_blurHeight = 0;
+    g_blurFormat = D3DFMT_UNKNOWN;
+    g_blurPrevValid = false;
+    g_motionWasActive = false;
+}
+
+bool EnsureBlurResources(IDirect3DDevice9* device, IDirect3DSurface9* backBuffer) {
+    if (!device || !backBuffer) return false;
+
+    D3DSURFACE_DESC desc{};
+    if (FAILED(backBuffer->GetDesc(&desc))) return false;
+
+    if (g_blurDevice == device &&
+        g_blurPrevTexture &&
+        g_blurCurrTexture &&
+        g_blurWidth == desc.Width &&
+        g_blurHeight == desc.Height &&
+        g_blurFormat == desc.Format) {
+        return true;
+    }
+
+    ReleaseBlurResources();
+
+    if (FAILED(device->CreateTexture(
+            desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET,
+            desc.Format, D3DPOOL_DEFAULT, &g_blurPrevTexture, nullptr))) {
+        return false;
+    }
+
+    if (FAILED(device->CreateTexture(
+            desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET,
+            desc.Format, D3DPOOL_DEFAULT, &g_blurCurrTexture, nullptr))) {
+        ReleaseBlurResources();
+        return false;
+    }
+
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &g_blurStateBlock))) {
+        ReleaseBlurResources();
+        return false;
+    }
+
+    g_blurDevice = device;
+    g_blurWidth = desc.Width;
+    g_blurHeight = desc.Height;
+    g_blurFormat = desc.Format;
+    g_blurPrevValid = false;
+
+    std::ostringstream ss;
+    ss << "Motion blur resources ready: "
+       << g_blurWidth << "x" << g_blurHeight
+       << " format=" << static_cast<int>(g_blurFormat);
+    LogLine(ss.str());
+    return true;
+}
+
+bool CopyBackBufferToTexture(
+    IDirect3DDevice9* device,
+    IDirect3DSurface9* backBuffer,
+    IDirect3DTexture9* texture
+) {
+    if (!device || !backBuffer || !texture) return false;
+
+    IDirect3DSurface9* dst = nullptr;
+    if (FAILED(texture->GetSurfaceLevel(0, &dst)) || !dst) return false;
+
+    const HRESULT hr = device->StretchRect(
+        backBuffer, nullptr, dst, nullptr, D3DTEXF_NONE
+    );
+    dst->Release();
+    return SUCCEEDED(hr);
+}
+
+void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
+    if (!g_motionBlurEnabled || g_motionBlurStrength <= 0.0) {
+        g_motionWasActive = false;
+        g_blurPrevValid = false;
+        return;
+    }
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+
+    bool motionActive = false;
+    if (g_lastMouseMotion.QuadPart != 0) {
+        motionActive = MsBetween(g_lastMouseMotion, now) <= g_motionBlurHoldMs;
+    }
+
+    if (!motionActive) {
+        g_motionWasActive = false;
+        g_blurPrevValid = false;
+        return;
+    }
+
+    IDirect3DSurface9* backBuffer = nullptr;
+    if (FAILED(device->GetRenderTarget(0, &backBuffer)) || !backBuffer) {
+        return;
+    }
+
+    if (!EnsureBlurResources(device, backBuffer)) {
+        if (InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
+            LogLine("Motion blur disabled for this run: resource creation failed.");
+        }
+        backBuffer->Release();
+        return;
+    }
+
+    // Capture the clean current frame before drawing the previous-frame blend.
+    if (!CopyBackBufferToTexture(device, backBuffer, g_blurCurrTexture)) {
+        if (InterlockedCompareExchange(&g_blurFailureLogged, 1, 0) == 0) {
+            LogLine("Motion blur disabled for this run: StretchRect failed.");
+        }
+        g_blurPrevValid = false;
+        backBuffer->Release();
+        return;
+    }
+
+    if (g_blurPrevValid && g_motionWasActive) {
+        struct BlurVertex {
+            float x, y, z, rhw;
+            float u, v;
+        };
+
+        const float w = static_cast<float>(g_blurWidth);
+        const float h = static_cast<float>(g_blurHeight);
+        const BlurVertex quad[4] = {
+            {-0.5f,     -0.5f,      0.0f, 1.0f, 0.0f, 0.0f},
+            {w - 0.5f,  -0.5f,      0.0f, 1.0f, 1.0f, 0.0f},
+            {-0.5f,      h - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f},
+            {w - 0.5f,   h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f}
+        };
+
+        if (SUCCEEDED(g_blurStateBlock->Capture())) {
+            const DWORD alphaByte = static_cast<DWORD>(
+                std::clamp(g_motionBlurStrength, 0.0, 0.35) * 255.0
+            );
+            const DWORD textureFactor = (alphaByte << 24) | 0x00FFFFFFu;
+
+            device->SetVertexShader(nullptr);
+            device->SetPixelShader(nullptr);
+            device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+            device->SetTexture(0, g_blurPrevTexture);
+
+            device->SetRenderState(D3DRS_ZENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            device->SetRenderState(D3DRS_TEXTUREFACTOR, textureFactor);
+            device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+
+            device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+            device->DrawPrimitiveUP(
+                D3DPT_TRIANGLESTRIP,
+                2,
+                quad,
+                sizeof(BlurVertex)
+            );
+
+            g_blurStateBlock->Apply();
+        }
+    }
+
+    std::swap(g_blurPrevTexture, g_blurCurrTexture);
+    g_blurPrevValid = true;
+    g_motionWasActive = true;
+    backBuffer->Release();
+}
+
 HRESULT STDMETHODCALLTYPE Hook_D3DPresent(
     void* self,
     const RECT* sourceRect,
@@ -519,6 +762,11 @@ HRESULT STDMETHODCALLTYPE Hook_D3DPresent(
     const RGNDATA* dirtyRegion
 ) {
     RecordPresent();
+
+    if (g_motionBlurEnabled) {
+        ApplyTurnMotionBlur(static_cast<IDirect3DDevice9*>(self));
+    }
+
     return g_originalD3DPresent(self, sourceRect, destRect, destWindow, dirtyRegion);
 }
 
@@ -836,7 +1084,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.11 direct Present diagnostic starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.12 time-based smoothing + turn blur test starting (x86).");
 
     {
         std::ostringstream cfg;
@@ -845,7 +1093,12 @@ DWORD WINAPI InitThread(LPVOID) {
             << " sensitivity=" << g_sensitivityMultiplier
             << " stallProtection=" << (g_stallProtection ? 1 : 0)
             << " stallThresholdMs=" << g_stallThresholdMs
-            << " stallAlphaScale=" << g_stallAlphaScale;
+            << " stallAlphaScale=" << g_stallAlphaScale
+            << " timeBased=" << (g_timeBasedSmoothing ? 1 : 0)
+            << " smoothingReferenceMs=" << g_smoothingReferenceMs
+            << " motionBlur=" << (g_motionBlurEnabled ? 1 : 0)
+            << " blurStrength=" << g_motionBlurStrength
+            << " blurHoldMs=" << g_motionBlurHoldMs;
         LogLine(cfg.str());
     }
 
