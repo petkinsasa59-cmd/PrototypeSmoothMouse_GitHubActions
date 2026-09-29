@@ -33,6 +33,7 @@ using D3DCreateDeviceFn = HRESULT (STDMETHODCALLTYPE*)(
 using D3DPresentFn = HRESULT (STDMETHODCALLTYPE*)(
     void*, const RECT*, const RECT*, HWND, const RGNDATA*
 );
+using D3DEndSceneFn = HRESULT (STDMETHODCALLTYPE*)(void*);
 
 DirectInput8CreateFn g_originalDirectInput8Create = nullptr;
 CreateDeviceFn g_originalCreateDevice = nullptr;
@@ -42,6 +43,7 @@ SetDataFormatFn g_originalSetDataFormat = nullptr;
 
 D3DCreateDeviceFn g_originalD3DCreateDevice = nullptr;
 D3DPresentFn g_originalD3DPresent = nullptr;
+D3DEndSceneFn g_originalD3DEndScene = nullptr;
 void* g_d3dDevice = nullptr;
 
 void* g_mouseDevice = nullptr;
@@ -72,12 +74,12 @@ bool g_timeBasedSmoothing = true;
 double g_smoothingReferenceMs = 4.0;
 
 bool g_motionBlurEnabled = false;
-double g_motionBlurStrength = 0.16;
+double g_motionBlurStrength = 0.22;
 double g_motionBlurHoldMs = 70.0;
-double g_motionBlurHistoryMs = 12.0;
-double g_motionBlurTrailScale = 0.80;
-double g_motionBlurStallBoost = 0.10;
-int g_motionBlurSamples = 4;
+double g_motionBlurHistoryMs = 16.0;
+double g_motionBlurTrailScale = 1.10;
+double g_motionBlurStallBoost = 0.12;
+int g_motionBlurSamples = 6;
 
 LARGE_INTEGER g_qpcFreq{};
 LARGE_INTEGER g_windowStart{};
@@ -163,12 +165,12 @@ void LoadConfig() {
     g_smoothingReferenceMs = std::clamp(static_cast<double>(ReadFloat("Mouse", "SmoothingReferenceMs", 4.0f)), 1.0, 16.0);
 
     g_motionBlurEnabled = GetPrivateProfileIntA("Visual", "MotionBlur", 1, g_iniPath.c_str()) != 0;
-    g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.16f)), 0.0, 0.35);
+    g_motionBlurStrength = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStrength", 0.22f)), 0.0, 0.35);
     g_motionBlurHoldMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHoldMs", 70.0f)), 10.0, 250.0);
-    g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 12.0f)), 2.0, 30.0);
-    g_motionBlurTrailScale = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurTrailScale", 0.80f)), 0.0, 3.0);
-    g_motionBlurStallBoost = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStallBoost", 0.10f)), 0.0, 0.25);
-    g_motionBlurSamples = std::clamp(static_cast<int>(GetPrivateProfileIntA("Visual", "MotionBlurSamples", 4, g_iniPath.c_str())), 1, 8);
+    g_motionBlurHistoryMs = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurHistoryMs", 16.0f)), 2.0, 30.0);
+    g_motionBlurTrailScale = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurTrailScale", 1.10f)), 0.0, 3.0);
+    g_motionBlurStallBoost = std::clamp(static_cast<double>(ReadFloat("Visual", "MotionBlurStallBoost", 0.12f)), 0.0, 0.25);
+    g_motionBlurSamples = std::clamp(static_cast<int>(GetPrivateProfileIntA("Visual", "MotionBlurSamples", 6, g_iniPath.c_str())), 1, 8);
 }
 
 double MsBetween(const LARGE_INTEGER& a, const LARGE_INTEGER& b) {
@@ -877,12 +879,20 @@ HRESULT STDMETHODCALLTYPE Hook_D3DPresent(
     const RGNDATA* dirtyRegion
 ) {
     RecordPresent();
+    return g_originalD3DPresent(self, sourceRect, destRect, destWindow, dirtyRegion);
+}
 
-    if (g_motionBlurEnabled) {
+HRESULT STDMETHODCALLTYPE Hook_D3DEndScene(void* self) {
+    // Let the game finish its own scene first. Then render the blur in a tiny
+    // separate scene before Present. This is more reliable with D3D9/DXVK than
+    // trying to append drawing directly inside Present.
+    const HRESULT hr = g_originalD3DEndScene(self);
+
+    if (SUCCEEDED(hr) && g_motionBlurEnabled) {
         ApplyTurnMotionBlur(static_cast<IDirect3DDevice9*>(self));
     }
 
-    return g_originalD3DPresent(self, sourceRect, destRect, destWindow, dirtyRegion);
+    return hr;
 }
 
 bool HookD3DDevice(void* device) {
@@ -893,9 +903,11 @@ bool HookD3DDevice(void* device) {
 
     g_d3dDevice = device;
     void* presentTarget = vtable[17];
+    void* endSceneTarget = vtable[42];
 
     std::ostringstream ss;
     ss << "D3D9 real device: Present=" << presentTarget
+       << " EndScene=" << endSceneTarget
        << " self=" << device;
     LogLine(ss.str());
 
@@ -915,7 +927,23 @@ bool HookD3DDevice(void* device) {
         return false;
     }
 
-    LogLine("Hooked D3D9 Present for frame-time diagnostics.");
+    const MH_STATUS createEndScene = MH_CreateHook(
+        endSceneTarget,
+        reinterpret_cast<void*>(&Hook_D3DEndScene),
+        reinterpret_cast<void**>(&g_originalD3DEndScene)
+    );
+    if (createEndScene != MH_OK && createEndScene != MH_ERROR_ALREADY_CREATED) {
+        LogLine("ERROR: MH_CreateHook(D3D9 EndScene) failed: " + std::to_string(static_cast<int>(createEndScene)));
+        return false;
+    }
+
+    const MH_STATUS enableEndScene = MH_EnableHook(endSceneTarget);
+    if (enableEndScene != MH_OK && enableEndScene != MH_ERROR_ENABLED) {
+        LogLine("ERROR: MH_EnableHook(D3D9 EndScene) failed: " + std::to_string(static_cast<int>(enableEndScene)));
+        return false;
+    }
+
+    LogLine("Hooked D3D9 Present + EndScene. Blur now renders after the game's EndScene.");
     return true;
 }
 
@@ -1199,7 +1227,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.14 directional turn motion blur test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.15 EndScene motion blur test starting (x86).");
 
     {
         std::ostringstream cfg;
