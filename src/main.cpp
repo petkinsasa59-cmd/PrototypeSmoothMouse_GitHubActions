@@ -45,6 +45,7 @@ D3DCreateDeviceFn g_originalD3DCreateDevice = nullptr;
 D3DPresentFn g_originalD3DPresent = nullptr;
 D3DEndSceneFn g_originalD3DEndScene = nullptr;
 void* g_d3dDevice = nullptr;
+thread_local bool g_insideBlurPass = false;
 
 void* g_mouseDevice = nullptr;
 volatile LONG g_loggedFirstStateCall = 0;
@@ -833,7 +834,11 @@ void ApplyTurnMotionBlur(IDirect3DDevice9* device) {
         }
 
         if (beganScene) {
-            device->EndScene();
+            // Never call the virtual EndScene here: it is hooked and would
+            // recurse back into Hook_D3DEndScene until the game crashes.
+            if (g_originalD3DEndScene) {
+                g_originalD3DEndScene(device);
+            }
         }
 
         g_blurStateBlock->Apply();
@@ -883,13 +888,22 @@ HRESULT STDMETHODCALLTYPE Hook_D3DPresent(
 }
 
 HRESULT STDMETHODCALLTYPE Hook_D3DEndScene(void* self) {
-    // Let the game finish its own scene first. Then render the blur in a tiny
-    // separate scene before Present. This is more reliable with D3D9/DXVK than
-    // trying to append drawing directly inside Present.
+    if (!g_originalD3DEndScene) {
+        return D3DERR_INVALIDCALL;
+    }
+
+    // If our own blur pass ever reaches EndScene through the vtable, bypass
+    // the hook body and call the original method directly.
+    if (g_insideBlurPass) {
+        return g_originalD3DEndScene(self);
+    }
+
     const HRESULT hr = g_originalD3DEndScene(self);
 
     if (SUCCEEDED(hr) && g_motionBlurEnabled) {
+        g_insideBlurPass = true;
         ApplyTurnMotionBlur(static_cast<IDirect3DDevice9*>(self));
+        g_insideBlurPass = false;
     }
 
     return hr;
@@ -1227,7 +1241,7 @@ DWORD WINAPI InitThread(LPVOID) {
         g_log.open(g_logPath, std::ios::out | std::ios::trunc);
     }
 
-    LogLine("PrototypeSmoothMouse v0.15 EndScene motion blur test starting (x86).");
+    LogLine("PrototypeSmoothMouse v0.16 EndScene recursion fix starting (x86).");
 
     {
         std::ostringstream cfg;
